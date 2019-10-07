@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * Application UART driver for:
  *	Freescale STMP37XX/STMP378X
@@ -9,10 +10,6 @@
  *	Provide Alphascale ASM9260 support.
  * Copyright 2008-2010 Freescale Semiconductor, Inc.
  * Copyright 2008 Embedded Alley Solutions, Inc All Rights Reserved.
- *
- * The code contained herein is licensed under the GNU General Public
- * License. You may obtain a copy of the GNU General Public License
- * Version 2 or later at the following locations:
  */
 
 #if defined(CONFIG_SERIAL_MXS_AUART_CONSOLE) && defined(CONFIG_MAGIC_SYSRQ)
@@ -43,7 +40,6 @@
 
 #include <asm/cacheflush.h>
 
-#include <linux/gpio.h>
 #include <linux/gpio/consumer.h>
 #include <linux/err.h>
 #include <linux/irq.h>
@@ -428,6 +424,7 @@ struct mxs_auart_port {
 #define MXS_AUART_DMA_TX_SYNC	2  /* bit 2 */
 #define MXS_AUART_DMA_RX_READY	3  /* bit 3 */
 #define MXS_AUART_RTSCTS	4  /* bit 4 */
+#define MXS_AUART_RTSGPIO	5  /* bit 5 */
 	unsigned long flags;
 	unsigned int mctrl_prev;
 	enum mxs_auart_type devtype;
@@ -527,10 +524,16 @@ static void mxs_clr(unsigned int val, struct mxs_auart_port *uap,
 }
 
 static void mxs_auart_stop_tx(struct uart_port *u);
+static void mxs_auart_start_rx(struct uart_port *u);
+static void mxs_auart_stop_rx(struct uart_port *u);
+
+static unsigned int mxs_auart_tx_empty(struct uart_port *u);
 
 #define to_auart_port(u) container_of(u, struct mxs_auart_port, port)
 
 static void mxs_auart_tx_chars(struct mxs_auart_port *s);
+
+void uart_get_rs485_mode(struct device *dev, struct serial_rs485 *rs485conf);
 
 static void dma_tx_callback(void *param)
 {
@@ -643,6 +646,18 @@ static void mxs_auart_tx_chars(struct mxs_auart_port *s)
 		mxs_clr(AUART_INTR_TXIEN, s, REG_INTR);
 	else
 		mxs_set(AUART_INTR_TXIEN, s, REG_INTR);
+		
+	if (uart_circ_empty(&(s->port.state->xmit))){
+		if (s->port.rs485.flags & SER_RS485_ENABLED){
+			while (!mxs_auart_tx_empty(&s->port)){
+				mdelay(1);
+			}
+			mdelay(s->port.rs485.delay_rts_after_send);
+			if (!(s->port.rs485.flags & SER_RS485_RX_DURING_TX)){
+				mxs_auart_start_rx(&s->port);
+			}
+		}
+	}
 
 	if (uart_tx_stopped(&s->port))
 		mxs_auart_stop_tx(&s->port);
@@ -752,7 +767,9 @@ static void mxs_auart_set_mctrl(struct uart_port *u, unsigned mctrl)
 
 	mxs_write(ctrl, s, REG_CTRL2);
 
-	mctrl_gpio_set(s->gpios, mctrl);
+	if (s->port.rs485.flags & SER_RS485_ENABLED){
+		mctrl_gpio_set(s->gpios, mctrl);
+	}
 }
 
 #define MCTRL_ANY_DELTA        (TIOCM_RI | TIOCM_DSR | TIOCM_CD | TIOCM_CTS)
@@ -1278,10 +1295,17 @@ static void mxs_auart_shutdown(struct uart_port *u)
 static unsigned int mxs_auart_tx_empty(struct uart_port *u)
 {
 	struct mxs_auart_port *s = to_auart_port(u);
-
+	
 	if ((mxs_read(s, REG_STAT) &
-		 (AUART_STAT_TXFE | AUART_STAT_BUSY)) == AUART_STAT_TXFE)
-		return TIOCSER_TEMT;
+		 (AUART_STAT_TXFE | AUART_STAT_BUSY)) == AUART_STAT_TXFE){
+		 	if (s->port.rs485.flags & SER_RS485_ENABLED){
+				if (s->port.mctrl & TIOCM_RTS){
+					s->port.mctrl &= ~TIOCM_RTS;
+					mctrl_gpio_set(s->gpios, s->port.mctrl);
+					}
+			}
+			return TIOCSER_TEMT;
+		}
 
 	return 0;
 }
@@ -1289,6 +1313,17 @@ static unsigned int mxs_auart_tx_empty(struct uart_port *u)
 static void mxs_auart_start_tx(struct uart_port *u)
 {
 	struct mxs_auart_port *s = to_auart_port(u);
+	
+	if (!s->port.x_char && uart_circ_empty(&u->state->xmit))
+		return;
+	
+	if (s->port.rs485.flags & SER_RS485_ENABLED){
+		if (!(s->port.rs485.flags & SER_RS485_RX_DURING_TX)){
+				mxs_auart_stop_rx(u);
+		}		
+		s->port.mctrl |= TIOCM_RTS;
+		mctrl_gpio_set(s->gpios, s->port.mctrl);		
+	}	
 
 	/* enable transmitter */
 	mxs_set(AUART_CTRL2_TXE, s, REG_CTRL2);
@@ -1299,8 +1334,20 @@ static void mxs_auart_start_tx(struct uart_port *u)
 static void mxs_auart_stop_tx(struct uart_port *u)
 {
 	struct mxs_auart_port *s = to_auart_port(u);
+	
+	if (s->port.rs485.flags & SER_RS485_ENABLED){		
+		s->port.mctrl &= ~TIOCM_RTS;
+		mctrl_gpio_set(s->gpios, s->port.mctrl);
+	}
 
 	mxs_clr(AUART_CTRL2_TXE, s, REG_CTRL2);
+}
+
+static void mxs_auart_start_rx(struct uart_port *u)
+{
+	struct mxs_auart_port *s = to_auart_port(u);
+
+	mxs_set(AUART_CTRL2_RXE, s, REG_CTRL2);
 }
 
 static void mxs_auart_stop_rx(struct uart_port *u)
@@ -1476,7 +1523,7 @@ auart_console_setup(struct console *co, char *options)
 }
 
 static struct console auart_console = {
-	.name		= "ttyAPP",
+	.name		= "ttySP",
 	.write		= auart_console_write,
 	.device		= uart_console_device,
 	.setup		= auart_console_setup,
@@ -1488,8 +1535,8 @@ static struct console auart_console = {
 
 static struct uart_driver auart_driver = {
 	.owner		= THIS_MODULE,
-	.driver_name	= "ttyAPP",
-	.dev_name	= "ttyAPP",
+	.driver_name	= "ttySP",
+	.dev_name	= "ttySP",
 	.major		= 0,
 	.minor		= 0,
 	.nr		= MXS_AUART_PORTS,
@@ -1553,6 +1600,25 @@ disable_clk_ahb:
 	return err;
 }
 
+/* called with port.lock taken and irqs off or from .probe without locking */
+static int imx_uart_rs485_config(struct uart_port *port,
+				 struct serial_rs485 *rs485conf)
+{	
+	struct mxs_auart_port *s = to_auart_port(port);	
+
+	/* unimplemented */
+	//rs485conf->delay_rts_before_send = 0;		
+
+	// GPIO RTS is required to control the transmitter */
+	if ((rs485conf->flags & SER_RS485_ENABLED) && (!test_bit(MXS_AUART_RTSGPIO, &s->flags))){
+		rs485conf->flags &= ~SER_RS485_ENABLED;
+	}
+
+	port->rs485 = *rs485conf;
+
+	return 0;
+}
+
 /*
  * This function returns 1 if pdev isn't a device instatiated by dt, 0 if it
  * could successfully get all information from dt or a negative errno.
@@ -1577,6 +1643,9 @@ static int serial_mxs_probe_dt(struct mxs_auart_port *s,
 	if (of_get_property(np, "uart-has-rtscts", NULL) ||
 	    of_get_property(np, "fsl,uart-has-rtscts", NULL) /* deprecated */)
 		set_bit(MXS_AUART_RTSCTS, &s->flags);
+		
+	if (of_get_property(np, "rts-gpios", NULL))
+		set_bit(MXS_AUART_RTSGPIO, &s->flags);
 
 	return 0;
 }
@@ -1600,7 +1669,7 @@ static int mxs_auart_init_gpios(struct mxs_auart_port *s, struct device *dev)
 
 	for (i = 0; i < UART_GPIO_MAX; i++) {
 		gpiod = mctrl_gpio_to_gpiod(s->gpios, i);
-		if (gpiod && (gpiod_get_direction(gpiod) == GPIOF_DIR_IN))
+		if (gpiod && (gpiod_get_direction(gpiod) == 1))
 			s->gpio_irq[i] = gpiod_to_irq(gpiod);
 		else
 			s->gpio_irq[i] = -EINVAL;
@@ -1646,6 +1715,8 @@ static int mxs_auart_request_gpio_irq(struct mxs_auart_port *s)
 	return err;
 }
 
+
+
 static int mxs_auart_probe(struct platform_device *pdev)
 {
 	const struct of_device_id *of_id =
@@ -1667,6 +1738,10 @@ static int mxs_auart_probe(struct platform_device *pdev)
 		s->port.line = pdev->id < 0 ? 0 : pdev->id;
 	else if (ret < 0)
 		return ret;
+	if (s->port.line >= ARRAY_SIZE(auart_port)) {
+		dev_err(&pdev->dev, "serial%d out of range\n", s->port.line);
+		return -EINVAL;
+	}
 
 	if (of_id) {
 		pdev->id_entry = of_id->data;
@@ -1678,8 +1753,10 @@ static int mxs_auart_probe(struct platform_device *pdev)
 		return ret;
 
 	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!r)
-		return -ENXIO;
+	if (!r) {
+		ret = -ENXIO;
+		goto out_disable_clks;
+	}
 
 	s->port.mapbase = r->start;
 	s->port.membase = ioremap(r->start, resource_size(r));
@@ -1688,27 +1765,33 @@ static int mxs_auart_probe(struct platform_device *pdev)
 	s->port.fifosize = MXS_AUART_FIFO_SIZE;
 	s->port.uartclk = clk_get_rate(s->clk);
 	s->port.type = PORT_IMX;
+	s->port.rs485_config = imx_uart_rs485_config;
 
 	mxs_init_regs(s);
 
 	s->mctrl_prev = 0;
 
 	irq = platform_get_irq(pdev, 0);
-	if (irq < 0)
-		return irq;
+	if (irq < 0) {
+		ret = irq;
+		goto out_disable_clks;
+	}
 
 	s->port.irq = irq;
 	ret = devm_request_irq(&pdev->dev, irq, mxs_auart_irq_handle, 0,
 			       dev_name(&pdev->dev), s);
 	if (ret)
-		return ret;
+		goto out_disable_clks;
 
 	platform_set_drvdata(pdev, s);
+	
+	uart_get_rs485_mode(&pdev->dev, &s->port.rs485);
+	imx_uart_rs485_config(&s->port, &s->port.rs485);
 
 	ret = mxs_auart_init_gpios(s, &pdev->dev);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to initialize GPIOs.\n");
-		return ret;
+		goto out_disable_clks;
 	}
 
 	/*
@@ -1716,7 +1799,7 @@ static int mxs_auart_probe(struct platform_device *pdev)
 	 */
 	ret = mxs_auart_request_gpio_irq(s);
 	if (ret)
-		return ret;
+		goto out_disable_clks;
 
 	auart_port[s->port.line] = s;
 
@@ -1724,7 +1807,7 @@ static int mxs_auart_probe(struct platform_device *pdev)
 
 	ret = uart_add_one_port(&auart_driver, &s->port);
 	if (ret)
-		goto out_free_gpio_irq;
+		goto out_free_qpio_irq;
 
 	/* ASM9260 don't have version reg */
 	if (is_asm9260_auart(s)) {
@@ -1738,9 +1821,15 @@ static int mxs_auart_probe(struct platform_device *pdev)
 
 	return 0;
 
-out_free_gpio_irq:
+out_free_qpio_irq:
 	mxs_auart_free_gpio_irq(s);
 	auart_port[pdev->id] = NULL;
+
+out_disable_clks:
+	if (is_asm9260_auart(s)) {
+		clk_disable_unprepare(s->clk);
+		clk_disable_unprepare(s->clk_ahb);
+	}
 	return ret;
 }
 
@@ -1751,6 +1840,10 @@ static int mxs_auart_remove(struct platform_device *pdev)
 	uart_remove_one_port(&auart_driver, &s->port);
 	auart_port[pdev->id] = NULL;
 	mxs_auart_free_gpio_irq(s);
+	if (is_asm9260_auart(s)) {
+		clk_disable_unprepare(s->clk);
+		clk_disable_unprepare(s->clk_ahb);
+	}
 
 	return 0;
 }
