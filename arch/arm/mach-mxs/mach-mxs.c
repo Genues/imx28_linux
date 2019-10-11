@@ -167,7 +167,7 @@ static void __init update_fec_mac_prop(enum mac_oui oui)
 	struct property *newmac;
 	const u32 *ocotp = mxs_get_ocotp();
 	u8 *macaddr;
-	u32 val;
+	u32 val[2];
 	int i;
 
 	for (i = 0; i < 2; i++) {
@@ -197,37 +197,15 @@ static void __init update_fec_mac_prop(enum mac_oui oui)
 		 * so hard-code OUI here.
 		 */
 		macaddr = newmac->value;
-		switch (oui) {
-		case OUI_FSL:
-			macaddr[0] = 0x00;
-			macaddr[1] = 0x04;
-			macaddr[2] = 0x9f;
-			break;
-		case OUI_DENX:
-			macaddr[0] = 0xc0;
-			macaddr[1] = 0xe5;
-			macaddr[2] = 0x4e;
-			break;
-		case OUI_CRYSTALFONTZ:
-			macaddr[0] = 0x58;
-			macaddr[1] = 0xb9;
-			macaddr[2] = 0xe1;
-			break;
-		case OUI_I2SE:
-			macaddr[0] = 0x00;
-			macaddr[1] = 0x01;
-			macaddr[2] = 0x87;
-			break;
-		case OUI_ARMADEUS:
-			macaddr[0] = 0x00;
-			macaddr[1] = 0x1e;
-			macaddr[2] = 0xac;
-			break;
-		}
-		val = ocotp[i];
-		macaddr[3] = (val >> 16) & 0xff;
-		macaddr[4] = (val >> 8) & 0xff;
-		macaddr[5] = (val >> 0) & 0xff;
+		val[0] = ocotp[0];
+		val[1] = ocotp[1];
+
+		macaddr[0] = (val[0] >> 24) & 0xFF;
+		macaddr[1] = (val[0] >> 16) & 0xFF;
+		macaddr[2] = (val[0] >> 8) & 0xFF;
+		macaddr[3] = (val[0] >> 0) & 0xFF;
+		macaddr[4] = (val[1] >> 8) & 0xFF;
+		macaddr[5] = ((val[1] >> 0) + i) & 0xFF ;
 
 		of_update_property(np, newmac);
 	}
