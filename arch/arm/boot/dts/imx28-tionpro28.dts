@@ -116,6 +116,7 @@
 						MX28_PAD_LCD_RESET__GPIO_3_30
 						MX28_PAD_AUART3_CTS__GPIO_3_14
 						MX28_PAD_AUART3_RTS__GPIO_3_15
+						MX28_PAD_LCD_WR_RWN__GPIO_1_25
 					>;
 					fsl,drive-strength = <MXS_DRIVE_4mA>;
 					fsl,voltage = <MXS_VOLTAGE_HIGH>;
@@ -156,8 +157,8 @@
 				lcdif_pins_evk: lcdif-evk@0 {
 					reg = <0>;
 					fsl,pinmux-ids = <
-						MX28_PAD_LCD_RD_E__LCD_VSYNC
-						MX28_PAD_LCD_WR_RWN__LCD_HSYNC
+						MX28_PAD_LCD_VSYNC__LCD_VSYNC
+						MX28_PAD_LCD_HSYNC__LCD_HSYNC
 						MX28_PAD_LCD_DOTCLK__LCD_DOTCLK
 						MX28_PAD_LCD_ENABLE__LCD_ENABLE
 					>;
